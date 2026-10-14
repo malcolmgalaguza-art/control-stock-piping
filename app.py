@@ -29,20 +29,35 @@ def num(v):
     except ValueError: return 0.0
 
 def read_stock(file):
-    df = pd.read_excel(file)
-    cols = {norm(c): c for c in df.columns}
+    # Leer todo el archivo SAP para construir el maestro de descripciones,
+    # sin filtrar por centro. El stock para cálculos sí se limita a CENTROS.
+    file.seek(0)
+    raw = pd.read_excel(file)
+    cols = {norm(c): c for c in raw.columns}
     needed = ["MATERIAL", "TEXTO BREVE DE MATERIAL", "CENTRO", "LIBRE UTILIZACION"]
     missing = [c for c in needed if c not in cols]
-    if missing: raise ValueError(f"Faltan columnas en stock SAP: {missing}")
-    df = df.rename(columns={
-        cols["MATERIAL"]: "SAP", cols["TEXTO BREVE DE MATERIAL"]: "Descripción",
+    if missing:
+        raise ValueError(f"Faltan columnas en stock SAP: {missing}")
+    raw = raw.rename(columns={
+        cols["MATERIAL"]: "SAP", cols["TEXTO BREVE DE MATERIAL"]: "Descripción SAP",
         cols["CENTRO"]: "Centro", cols["LIBRE UTILIZACION"]: "Cantidad"
     })
-    df["SAP"] = df["SAP"].map(sap_clean)
-    df["Centro"] = pd.to_numeric(df["Centro"], errors="coerce")
-    df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0)
-    df = df[df["Centro"].isin(CENTROS) & (df["SAP"] != "")]
-    return df.groupby(["SAP", "Descripción", "Centro"], as_index=False)["Cantidad"].sum()
+    raw["SAP"] = raw["SAP"].map(sap_clean)
+    raw["Centro"] = pd.to_numeric(raw["Centro"], errors="coerce")
+    raw["Cantidad"] = pd.to_numeric(raw["Cantidad"], errors="coerce").fillna(0)
+    raw["Descripción SAP"] = raw["Descripción SAP"].fillna("").astype(str).str.strip()
+
+    # Maestro de descripciones completo, sin filtrar centros.
+    descs = {}
+    for _, r in raw[raw["SAP"] != ""].iterrows():
+        code, desc = r["SAP"], r["Descripción SAP"]
+        if desc and code not in descs:
+            descs[code] = desc
+
+    stock = raw[raw["Centro"].isin(CENTROS) & (raw["SAP"] != "")].copy()
+    stock = stock.rename(columns={"Descripción SAP": "Descripción"})
+    stock = stock.groupby(["SAP", "Descripción", "Centro"], as_index=False)["Cantidad"].sum()
+    return stock, descs
 
 def find_center(file, sheet):
     sample = pd.read_excel(file, sheet_name=sheet, header=None, nrows=8)
@@ -79,9 +94,8 @@ def find_header(file, sheet):
     return None
 
 def process(stock_file, package_files):
-    stock = read_stock(stock_file)
+    stock, descs = read_stock(stock_file)
     stock_dict = stock.groupby(["SAP", "Centro"])["Cantidad"].sum().to_dict()
-    descs = stock.drop_duplicates("SAP").set_index("SAP")["Descripción"].to_dict()
     rows, issues, audit = [], [], []
     skip_tokens = ["STOCK", "AVANCE", "RESUMEN", "TABLA6", "TABLA 6"]
     for file in package_files:
@@ -131,13 +145,17 @@ def process(stock_file, package_files):
                     code = sap_clean(row.iloc[sap_idx])
                     if not code or code.upper() in ["NAN", "SAP"]: continue
                     pending = num(row.iloc[p_idx])
-                    description = str(row.iloc[desc_idx]).strip() if pd.notna(row.iloc[desc_idx]) else descs.get(code, "")
+                    description_workshop = str(row.iloc[desc_idx]).strip() if pd.notna(row.iloc[desc_idx]) else ""
+                    # La descripción principal siempre sale del maestro de materiales del stock SAP.
+                    # La descripción escrita en el archivo del taller se conserva en otra columna para comparar.
+                    description_sap = descs.get(code, "")
                     local_stock = max(float(stock_dict.get((code, center), 0)), 0)
                     pending_pos = max(pending, 0)
                     suggested = min(pending_pos, local_stock) if quality == "CONFIRMAR" else 0
                     rows.append({
                         "Taller": workshop, "Paquete": sheet, "Centro destino": int(center),
-                        "SAP": code, "Descripción": description, "Columna pendiente": p_name,
+                        "SAP": code, "Descripción SAP": description_sap if description_sap else "NO ENCONTRADO EN STOCK SAP", "Descripción taller": description_workshop,
+                        "Columna pendiente": p_name,
                         "Pendiente original": pending, "Pendiente": pending_pos,
                         "Stock local SAP": local_stock, "Cantidad sugerida enviar local": suggested,
                         "Pendiente luego de stock local": max(pending_pos-suggested, 0),
@@ -193,7 +211,7 @@ def make_excel(report, issues, audit, workshop, center, only_sendable):
     return out.getvalue(), data, send, no_stock, review, summary
 
 st.title("📦 Control de Stock Piping")
-st.caption("Consulta de pendientes y materiales que podés enviar desde el stock del mismo centro.")
+st.caption("La descripción principal se toma del maestro SAP completo del archivo cargado; la descripción del taller queda separada para comparar.")
 
 with st.sidebar:
     st.header("Cargar archivos actualizados")
@@ -227,6 +245,9 @@ if "report" in st.session_state:
     c.metric("Enviables con stock local", len(sendable))
     d.metric("Requieren revisión", int((report["Validación"] != "CONFIRMAR").sum()))
     st.caption(f"Hojas de paquetes revisadas: {len(audit)} · Hojas con materiales incorporados: {int(audit['Filas incorporadas'].gt(0).sum())}")
+    desc_missing = int(report["Descripción SAP"].eq("NO ENCONTRADO EN STOCK SAP").sum())
+    if desc_missing:
+        st.warning(f"{desc_missing} filas no encontraron descripción en el archivo SAP cargado. Revisá los códigos en la columna SAP.")
 
     st.subheader("Filtrar materiales")
     c1, c2, c3 = st.columns(3)
@@ -241,7 +262,7 @@ if "report" in st.session_state:
 
     st.subheader("Materiales")
     st.dataframe(view[[
-        "Taller", "Paquete", "Centro destino", "SAP", "Descripción",
+        "Taller", "Paquete", "Centro destino", "SAP", "Descripción SAP", "Descripción taller",
         "Pendiente", "Stock local SAP", "Cantidad sugerida enviar local",
         "Pendiente luego de stock local", "Validación", "Estado"
     ]], use_container_width=True, hide_index=True)
