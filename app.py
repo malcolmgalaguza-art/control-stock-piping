@@ -54,12 +54,16 @@ def find_center(file, sheet):
 
 def pending_col(columns):
     names = [norm(c) for c in columns]
-    for group in [
-        ["RESTAN ENVIAR", "RESTA ENVIAR", "RESTAENVIAR", "RESTAN EVIAR"],
-        ["SALDO PENDIENTE"], ["CANTIDAD PENDIENTE", "PENDIENTE"]
-    ]:
-        for i, name in enumerate(names):
-            if name in group: return i, name, "CONFIRMAR"
+    # Primero buscar columnas explícitas de saldo pendiente, incluso errores frecuentes de tipeo.
+    explicit = {
+        "RESTAN ENVIAR", "RESTA ENVIAR", "RESTAENVIAR", "RESTAN EVIAR",
+        "RESTAN ENMVIAR", "RESTAN ENVIA R", "RESTANTE ENVIAR",
+        "SALDO PENDIENTE", "CANTIDAD PENDIENTE", "PENDIENTE"
+    }
+    for i, name in enumerate(names):
+        if name in explicit:
+            return i, name, "CONFIRMAR"
+    # Usar columnas genéricas de envío solo como respaldo y marcarlas para revisión.
     for i, name in enumerate(names):
         if name in ["ENVIAR", "ENVIAR A INTERACERO", "ENVIAR A TYCSA", "ENVIAR A TAPIGAR"]:
             return i, name, "REVISAR COLUMNA"
@@ -78,35 +82,51 @@ def process(stock_file, package_files):
     stock = read_stock(stock_file)
     stock_dict = stock.groupby(["SAP", "Centro"])["Cantidad"].sum().to_dict()
     descs = stock.drop_duplicates("SAP").set_index("SAP")["Descripción"].to_dict()
-    rows, issues = [], []
+    rows, issues, audit = [], [], []
+    skip_tokens = ["STOCK", "AVANCE", "RESUMEN", "TABLA6", "TABLA 6"]
     for file in package_files:
         file.seek(0)
-        try: book = pd.ExcelFile(file)
+        filename = getattr(file, "name", "archivo_sin_nombre")
+        try:
+            book = pd.ExcelFile(file)
         except Exception as e:
-            issues.append({"Archivo": file.name, "Hoja": "", "Motivo": str(e)})
+            issues.append({"Archivo": filename, "Hoja": "", "Motivo": str(e)})
+            audit.append({"Archivo": filename, "Hoja": "", "Estado": "ERROR DE LECTURA", "Filas incorporadas": 0, "Detalle": str(e)})
             continue
         for sheet in book.sheet_names:
-            if any(x in norm(sheet) for x in ["STOCK", "AVANCE", "RESUMEN", "TABLA6"]): continue
+            if any(x in norm(sheet) for x in skip_tokens):
+                audit.append({"Archivo": filename, "Hoja": sheet, "Estado": "OMITIDA (hoja auxiliar)", "Filas incorporadas": 0, "Detalle": "Hoja de stock, avance o resumen; no se procesa como paquete."})
+                continue
             try:
                 file.seek(0)
                 header = find_header(file, sheet)
-                if header is None: continue
+                if header is None:
+                    audit.append({"Archivo": filename, "Hoja": sheet, "Estado": "NO INTERPRETADA", "Filas incorporadas": 0, "Detalle": "No se encontró una fila de encabezados con SAP, Descripción y columna de pendiente reconocida."})
+                    issues.append({"Archivo": filename, "Hoja": sheet, "Motivo": "No se detectó encabezado válido (SAP, Descripción y columna de pendiente)."})
+                    continue
                 file.seek(0)
                 df = pd.read_excel(file, sheet_name=sheet, header=header)
                 df.columns = [str(c).strip() for c in df.columns]
                 names = [norm(c) for c in df.columns]
-                if "SAP" not in names or "DESCRIPCION" not in names: continue
+                if "SAP" not in names or "DESCRIPCION" not in names:
+                    audit.append({"Archivo": filename, "Hoja": sheet, "Estado": "NO INTERPRETADA", "Filas incorporadas": 0, "Detalle": "Falta SAP o Descripción."})
+                    issues.append({"Archivo": filename, "Hoja": sheet, "Motivo": "Falta SAP o Descripción."})
+                    continue
                 sap_idx, desc_idx = names.index("SAP"), names.index("DESCRIPCION")
                 p_idx, p_name, quality = pending_col(df.columns)
                 if p_idx is None:
-                    issues.append({"Archivo": file.name, "Hoja": sheet, "Motivo": "Sin columna pendiente"})
+                    audit.append({"Archivo": filename, "Hoja": sheet, "Estado": "NO INTERPRETADA", "Filas incorporadas": 0, "Detalle": "No se encontró columna de pendiente reconocida."})
+                    issues.append({"Archivo": filename, "Hoja": sheet, "Motivo": "Sin columna pendiente"})
                     continue
                 file.seek(0)
                 center = find_center(file, sheet)
                 if center is None:
-                    issues.append({"Archivo": file.name, "Hoja": sheet, "Motivo": "No se detectó centro destino"})
+                    audit.append({"Archivo": filename, "Hoja": sheet, "Estado": "NO INTERPRETADA", "Filas incorporadas": 0, "Detalle": "No se detectó centro destino."})
+                    issues.append({"Archivo": filename, "Hoja": sheet, "Motivo": "No se detectó centro destino"})
                     continue
-                workshop = next((x for x in ["TAPIGAR", "ARMEXAS", "INTERACERO", "TYCSA"] if x in norm(file.name)), "OTRO")
+                normalized_filename = norm(filename)
+                workshop = next((x for x in ["TAPIGAR", "ARMEXAS", "INTERACERO", "TYCSA"] if x in normalized_filename), "OTRO")
+                valid_rows = 0
                 for _, row in df.iterrows():
                     code = sap_clean(row.iloc[sap_idx])
                     if not code or code.upper() in ["NAN", "SAP"]: continue
@@ -124,13 +144,21 @@ def process(stock_file, package_files):
                         "Validación": quality,
                         "Estado": "REVISAR COLUMNA" if quality != "CONFIRMAR" else ("ENVIAR DESDE STOCK LOCAL" if suggested > 0 else "SIN STOCK LOCAL")
                     })
+                    valid_rows += 1
+                if valid_rows:
+                    audit.append({"Archivo": filename, "Hoja": sheet, "Estado": "PROCESADA" if quality == "CONFIRMAR" else "PROCESADA CON REVISIÓN", "Filas incorporadas": valid_rows, "Detalle": f"Centro {center}; columna usada: {p_name}; validación: {quality}."})
+                else:
+                    audit.append({"Archivo": filename, "Hoja": sheet, "Estado": "SIN MATERIALES", "Filas incorporadas": 0, "Detalle": f"Se detectaron encabezados, pero no se encontraron filas con código SAP. Columna: {p_name}."})
+                    issues.append({"Archivo": filename, "Hoja": sheet, "Motivo": "No se encontraron filas con código SAP después del encabezado."})
             except Exception as e:
-                issues.append({"Archivo": file.name, "Hoja": sheet, "Motivo": str(e)})
+                audit.append({"Archivo": filename, "Hoja": sheet, "Estado": "ERROR", "Filas incorporadas": 0, "Detalle": str(e)})
+                issues.append({"Archivo": filename, "Hoja": sheet, "Motivo": str(e)})
     report = pd.DataFrame(rows)
-    if report.empty: raise ValueError("No se encontraron tablas de paquetes válidas.")
-    return report, pd.DataFrame(issues), stock
+    audit_df = pd.DataFrame(audit)
+    if report.empty: raise ValueError("No se encontraron tablas de paquetes válidas. Revisá la hoja Control de lectura.")
+    return report, pd.DataFrame(issues), stock, audit_df
 
-def make_excel(report, issues, workshop, center, only_sendable):
+def make_excel(report, issues, audit, workshop, center, only_sendable):
     data = report.copy()
     if workshop != "Todos": data = data[data["Taller"] == workshop]
     if center != "Todos": data = data[data["Centro destino"] == int(center)]
@@ -153,6 +181,7 @@ def make_excel(report, issues, workshop, center, only_sendable):
         review.to_excel(writer, sheet_name="Revisar columnas", index=False)
         summary.to_excel(writer, sheet_name="Resumen talleres", index=False)
         issues.to_excel(writer, sheet_name="Incidencias", index=False)
+        audit.to_excel(writer, sheet_name="Control de lectura", index=False)
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
@@ -176,9 +205,10 @@ if stock_file and package_files:
     if st.button("🔄 Procesar y actualizar reporte", type="primary", use_container_width=True):
         with st.spinner("Procesando stock y paquetes..."):
             try:
-                report, issues, stock = process(stock_file, package_files)
+                report, issues, stock, audit = process(stock_file, package_files)
                 st.session_state["report"] = report
                 st.session_state["issues"] = issues
+                st.session_state["audit"] = audit
                 st.session_state["last_run"] = datetime.now().strftime("%d/%m/%Y %H:%M")
                 st.success("Proceso terminado. Validá las cantidades antes de preparar despachos.")
             except Exception as e:
@@ -187,6 +217,7 @@ if stock_file and package_files:
 if "report" in st.session_state:
     report = st.session_state["report"]
     issues = st.session_state["issues"]
+    audit = st.session_state["audit"]
     st.caption(f"Última actualización: {st.session_state['last_run']}")
     pending = report[report["Pendiente"] > 0]
     sendable = report[(report["Cantidad sugerida enviar local"] > 0) & (report["Validación"] == "CONFIRMAR")]
@@ -195,12 +226,13 @@ if "report" in st.session_state:
     b.metric("Con pendiente", len(pending))
     c.metric("Enviables con stock local", len(sendable))
     d.metric("Requieren revisión", int((report["Validación"] != "CONFIRMAR").sum()))
+    st.caption(f"Hojas de paquetes revisadas: {len(audit)} · Hojas con materiales incorporados: {int(audit['Filas incorporadas'].gt(0).sum())}")
 
     st.subheader("Filtrar materiales")
     c1, c2, c3 = st.columns(3)
     workshop = c1.selectbox("Taller", ["Todos"] + sorted(report["Taller"].dropna().unique().tolist()))
     center = c2.selectbox("Centro destino", ["Todos"] + [str(c) for c in CENTROS])
-    only_sendable = c3.checkbox("Mostrar solo lo que puedo enviar", value=True)
+    only_sendable = c3.checkbox("Mostrar solo lo que puedo enviar", value=False)
 
     view = report.copy()
     if workshop != "Todos": view = view[view["Taller"] == workshop]
@@ -214,11 +246,14 @@ if "report" in st.session_state:
         "Pendiente luego de stock local", "Validación", "Estado"
     ]], use_container_width=True, hide_index=True)
 
-    xlsx, _, _, _, _, summary = make_excel(report, issues, workshop, center, only_sendable)
+    xlsx, _, _, _, _, summary = make_excel(report, issues, audit, workshop, center, only_sendable)
     st.download_button("⬇️ Descargar Excel", xlsx, "PLAN_ENVIO_STOCK_LOCAL.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
     with st.expander("Resumen por taller"):
         st.dataframe(summary, use_container_width=True, hide_index=True)
+    with st.expander("Control de lectura de archivos y paquetes", expanded=True):
+        st.caption("Se muestran todas las hojas encontradas en los archivos cargados, incluidas las omitidas o no interpretadas.")
+        st.dataframe(audit, use_container_width=True, hide_index=True)
     with st.expander("Incidencias"):
         if issues.empty: st.success("No se registraron incidencias.")
         else: st.dataframe(issues, use_container_width=True, hide_index=True)
