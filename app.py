@@ -241,10 +241,46 @@ if "report" in st.session_state:
     sendable = report[(report["Cantidad sugerida enviar local"] > 0) & (report["Validación"] == "CONFIRMAR")]
     a, b, c, d = st.columns(4)
     a.metric("Filas de materiales", len(report))
-    b.metric("Con pendiente", len(pending))
-    c.metric("Enviables con stock local", len(sendable))
-    d.metric("Requieren revisión", int((report["Validación"] != "CONFIRMAR").sum()))
+    b.metric("Materiales con pendiente", len(pending))
+    c.metric("Materiales enviables", len(sendable))
+    d.metric("Filas a revisar", int((report["Validación"] != "CONFIRMAR").sum()))
     st.caption(f"Hojas de paquetes revisadas: {len(audit)} · Hojas con materiales incorporados: {int(audit['Filas incorporadas'].gt(0).sum())}")
+
+    # Dashboard: quantities are shown as material quantities, not as a percentage
+    # of package completion, because these source files do not always contain the original total.
+    st.header("📊 Tablero de avances y pendientes")
+    valid = report[report["Validación"] == "CONFIRMAR"].copy()
+    if valid.empty:
+        st.info("No hay filas con una columna de pendiente confirmada para graficar.")
+    else:
+        totals = pd.DataFrame({
+            "Concepto": ["Pendiente total", "Se puede cubrir con stock local", "Sigue pendiente después del stock local"],
+            "Cantidad": [valid["Pendiente"].sum(), valid["Cantidad sugerida enviar local"].sum(), valid["Pendiente luego de stock local"].sum()]
+        }).set_index("Concepto")
+        st.subheader("Vista general de cantidades")
+        st.bar_chart(totals, y="Cantidad", use_container_width=True)
+
+        workshop_dashboard = valid.groupby("Taller", as_index=True).agg(
+            **{"Pendiente total": ("Pendiente", "sum"),
+               "Cubierto con stock local": ("Cantidad sugerida enviar local", "sum"),
+               "Pendiente restante": ("Pendiente luego de stock local", "sum")}
+        ).sort_values("Pendiente total", ascending=False)
+        st.subheader("Pendientes por taller")
+        st.bar_chart(workshop_dashboard, use_container_width=True)
+
+        package_dashboard = valid.groupby(["Taller", "Paquete"], as_index=False).agg(
+            Pendiente=("Pendiente", "sum"),
+            **{"Stock local sugerido": ("Cantidad sugerida enviar local", "sum"),
+               "Saldo restante": ("Pendiente luego de stock local", "sum")}
+        )
+        package_dashboard["Taller / paquete"] = package_dashboard["Taller"] + " / " + package_dashboard["Paquete"].astype(str)
+        package_dashboard = package_dashboard.sort_values("Pendiente", ascending=False)
+        st.subheader("Paquetes con mayor pendiente")
+        st.caption("Se muestran los 15 paquetes con mayor cantidad pendiente. Las cantidades corresponden a unidades de los materiales, no a porcentaje de avance.")
+        top_packages = package_dashboard.head(15).set_index("Taller / paquete")[["Pendiente", "Stock local sugerido", "Saldo restante"]]
+        st.bar_chart(top_packages, use_container_width=True)
+        with st.expander("Ver tabla de avance y pendientes por paquete"):
+            st.dataframe(package_dashboard[["Taller", "Paquete", "Pendiente", "Stock local sugerido", "Saldo restante"]], use_container_width=True, hide_index=True)
     desc_missing = int(report["Descripción SAP"].eq("NO ENCONTRADO EN STOCK SAP").sum())
     if desc_missing:
         st.warning(f"{desc_missing} filas no encontraron descripción en el archivo SAP cargado. Revisá los códigos en la columna SAP.")
