@@ -69,15 +69,19 @@ def find_center(file, sheet):
 
 def pending_col(columns):
     names = [norm(c) for c in columns]
-    # Primero buscar columnas explícitas de saldo pendiente, incluso errores frecuentes de tipeo.
-    explicit = {
-        "RESTAN ENVIAR", "RESTA ENVIAR", "RESTAENVIAR", "RESTAN EVIAR",
-        "RESTAN ENMVIAR", "RESTAN ENVIA R", "RESTANTE ENVIAR",
-        "SALDO PENDIENTE", "CANTIDAD PENDIENTE", "PENDIENTE"
-    }
-    for i, name in enumerate(names):
-        if name in explicit:
-            return i, name, "CONFIRMAR"
+    # Priorizar la columna operativa de pendiente. Algunas planillas tienen
+    # "SALDO PENDIENTE" como columna auxiliar vacía/cero y "RESTAN ENVIAR"
+    # con los valores reales; por eso el saldo genérico queda como respaldo.
+    priorities = [
+        {"RESTAN ENVIAR", "RESTA ENVIAR", "RESTAENVIAR", "RESTAN EVIAR",
+         "RESTAN ENMVIAR", "RESTAN ENVIA R", "RESTANTE ENVIAR"},
+        {"CANTIDAD PENDIENTE", "PENDIENTE"},
+        {"SALDO PENDIENTE"},
+    ]
+    for group in priorities:
+        for i, name in enumerate(names):
+            if name in group:
+                return i, name, "CONFIRMAR"
     # Usar columnas genéricas de envío solo como respaldo y marcarlas para revisión.
     for i, name in enumerate(names):
         if name in ["ENVIAR", "ENVIAR A INTERACERO", "ENVIAR A TYCSA", "ENVIAR A TAPIGAR"]:
