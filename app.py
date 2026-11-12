@@ -121,11 +121,11 @@ def allocate_cross_center(report, stock, returns):
     No consulta ni utiliza almacén 0005. Cada cantidad se reserva una sola vez.
     """
     out = report.copy()
+    out["Cantidad sugerida enviar"] = 0.0
+    out["Origen del material"] = ""
     out["Cantidad sugerida enviar desde SMM"] = 0.0
     out["Cantidad sugerida por préstamo"] = 0.0
-    out["Centros que prestan"] = ""
     out["Pendiente final"] = out["Pendiente"]
-    out["Plan de abastecimiento"] = ""
     loan_cols = ["SAP", "Descripción SAP", "Tipo de movimiento", "Centro que envía", "Centro destino", "Taller", "Paquete", "Cantidad"]
     valid_idx = out.index[out["Validación"] == "CONFIRMAR"].tolist()
     if not valid_idx:
@@ -162,15 +162,15 @@ def allocate_cross_center(report, stock, returns):
             available[(code, donor)] -= take
             need -= take
             out.at[idx, "Cantidad sugerida por préstamo"] += take
-            movement_type = "STOCK DEL CENTRO DESTINO" if donor == dest else "PRÉSTAMO ENTRE CENTROS"
-            sources.append(f"{movement_type} - Centro {donor}: {take:g}")
+            movement_type = "CENTRO LOCAL" if donor == dest else "PRÉSTAMO"
+            source_label = f"CENTRO LOCAL {donor}: {take:g}" if donor == dest else f"PRÉSTAMO - PRESTA {donor}: {take:g}"
+            sources.append(source_label)
             movements.append({"SAP": code, "Descripción SAP": row["Descripción SAP"], "Tipo de movimiento": movement_type, "Centro que envía": donor, "Centro destino": dest, "Taller": row["Taller"], "Paquete": row["Paquete"], "Cantidad": take})
-        out.at[idx, "Centros que prestan"] = "; ".join(sources)
+        if take_smm > 0:
+            sources.insert(0, f"SMM - DEVOLUCIÓN: {take_smm:g}")
+        out.at[idx, "Origen del material"] = " | ".join(sources)
+        out.at[idx, "Cantidad sugerida enviar"] = float(out.at[idx, "Cantidad sugerida enviar desde SMM"]) + float(out.at[idx, "Cantidad sugerida por préstamo"])
         out.at[idx, "Pendiente final"] = max(need, 0.0)
-        plan = []
-        if take_smm > 0: plan.append(f"SMM devolución: {take_smm:g}")
-        if sources: plan.extend([f"PRÉSTAMO {x}" for x in sources])
-        out.at[idx, "Plan de abastecimiento"] = " | ".join(plan)
         if float(out.at[idx, "Pendiente"]) > 0 and need <= 0:
             out.at[idx, "Estado"] = "CUBIERTO CON SMM Y/O PRÉSTAMO"
         elif sources or take_smm > 0:
@@ -276,9 +276,16 @@ def make_excel(report, issues, audit, movements, stock, returns, workshop, cente
         Prestamos=("Cantidad sugerida por préstamo", "sum"),
         Pendiente_no_cubierto=("Pendiente final", "sum"))
     out = BytesIO()
+    compact_cols = [
+        "Taller", "Paquete", "Centro destino", "SAP", "Descripción SAP",
+        "Descripción taller", "Pendiente", "Cantidad sugerida enviar",
+        "Origen del material", "Pendiente final", "Validación", "Estado"
+    ]
+    detail_export = data[[c for c in compact_cols if c in data.columns]].copy()
+    send_export = send[[c for c in compact_cols if c in send.columns]].copy()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        data.to_excel(writer, sheet_name="Detalle", index=False)
-        send.to_excel(writer, sheet_name="Preparar envíos", index=False)
+        detail_export.to_excel(writer, sheet_name="Detalle", index=False)
+        send_export.to_excel(writer, sheet_name="Preparar envíos", index=False)
         movements.to_excel(writer, sheet_name="Préstamos y envíos", index=False)
         stock.to_excel(writer, sheet_name="Stock SAP 0008 por centro", index=False)
         returns.to_excel(writer, sheet_name="Devoluciones SMM", index=False)
@@ -298,14 +305,14 @@ def make_excel(report, issues, audit, movements, stock, returns, workshop, cente
     return out.getvalue(), data, send, no_stock, review, summary
 
 st.title("📦 Control de Stock Piping")
-st.caption("Solo almacén 0008 de los centros habilitados. El stock de otros centros se propone como PRÉSTAMO; las devoluciones se consideran stock adicional de SMM.")
+st.caption("Solo almacén 0008. En una única columna se indica el origen: CENTRO LOCAL (stock del centro destino), PRÉSTAMO - PRESTA (otro centro) o SMM - DEVOLUCIÓN.")
 
 with st.sidebar:
     st.header("Cargar archivos actualizados")
     stock_file = st.file_uploader("Stock SAP (.xlsx)", type=["xlsx", "xlsm"])
     returns_file = st.file_uploader("Stock adicional SMM - devoluciones (opcional)", type=["xlsx", "xlsm"])
     package_files = st.file_uploader("Archivos de paquetes (.xlsx / .xlsm)", type=["xlsx", "xlsm"], accept_multiple_files=True)
-    st.info("Se utiliza únicamente el almacén 0008. El stock de otros centros se propone como PRÉSTAMO; las devoluciones se consideran stock de SMM.")
+    st.info("Se utiliza únicamente el almacén 0008. El origen y tipo de movimiento se informa en una sola columna.")
 
 if stock_file and package_files:
     if st.button("🔄 Procesar y actualizar reporte", type="primary", use_container_width=True):
@@ -394,15 +401,15 @@ if "report" in st.session_state:
     st.subheader("Materiales")
     st.dataframe(view[[
         "Taller", "Paquete", "Centro destino", "SAP", "Descripción SAP", "Descripción taller",
-        "Pendiente", "Cantidad sugerida enviar desde SMM", "Cantidad sugerida por préstamo",
-        "Centros que prestan", "Plan de abastecimiento", "Pendiente final", "Validación", "Estado"
+        "Pendiente", "Cantidad sugerida enviar", "Origen del material",
+        "Pendiente final", "Validación", "Estado"
     ]], use_container_width=True, hide_index=True)
 
     st.subheader("📨 Préstamos entre centros y envíos desde SMM")
     if movements.empty:
         st.info("No hay envíos ni préstamos sugeridos con el stock y los paquetes cargados.")
     else:
-        st.caption("Los movimientos entre centros se identifican expresamente como PRÉSTAMO. Las devoluciones se consideran stock disponible en SMM.")
+        st.caption("CENTRO LOCAL identifica stock del centro destino; PRÉSTAMO - PRESTA identifica otro centro que aporta material; SMM - DEVOLUCIÓN identifica stock adicional en Monte.")
         st.dataframe(movements, use_container_width=True, hide_index=True)
 
     xlsx, _, _, _, _, summary = make_excel(report, issues, audit, movements, st.session_state["stock"], returns, workshop, center, only_sendable)
