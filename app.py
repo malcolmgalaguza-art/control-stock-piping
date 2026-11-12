@@ -29,8 +29,7 @@ def num(v):
     except ValueError: return 0.0
 
 def read_stock(file):
-    # 0008 = almacén central de Monte, sin importar el centro SAP.
-    # 0005 = stock físico de la planta identificada por el centro SAP.
+    # Solo almacén 0008. Cada centro conserva su stock como posible origen de préstamo.
     file.seek(0)
     raw = pd.read_excel(file)
     cols = {norm(c): c for c in raw.columns}
@@ -51,11 +50,33 @@ def read_stock(file):
     for _, r in raw[raw["SAP"] != ""].iterrows():
         if r["Descripción SAP"] and r["SAP"] not in descs:
             descs[r["SAP"]] = r["Descripción SAP"]
-    # Se excluyen centros 3115 y 3116. Se consideran únicamente almacenes 0008 y 0005.
-    stock = raw[raw["Centro"].isin(CENTROS) & raw["Almacén"].isin([5, 8]) & (raw["SAP"] != "")].copy()
+    stock = raw[raw["Centro"].isin(CENTROS) & (raw["Almacén"] == 8) & (raw["SAP"] != "")].copy()
     stock = stock.rename(columns={"Descripción SAP": "Descripción"})
-    stock = stock.groupby(["SAP", "Descripción", "Centro", "Almacén"], as_index=False)["Cantidad"].sum()
+    stock["Origen"] = "SAP 0008"
+    stock = stock.groupby(["SAP", "Descripción", "Centro", "Almacén", "Origen"], as_index=False)["Cantidad"].sum()
     return stock, descs
+
+def read_returns(file, descs):
+    if file is None:
+        return pd.DataFrame(columns=["SAP", "Descripción", "Centro", "Almacén", "Origen", "Cantidad", "Unidad de medida"])
+    file.seek(0)
+    raw = pd.read_excel(file)
+    cols = {norm(c): c for c in raw.columns}
+    code_col = next((cols[k] for k in ["CODIGO SAP", "CODIGO", "SAP", "MATERIAL"] if k in cols), None)
+    qty_col = next((cols[k] for k in ["CANTIDAD", "CANT", "LIBRE UTILIZACION"] if k in cols), None)
+    unit_col = next((cols[k] for k in ["UNIDAD DE MEDIDA", "UNIDAD", "UM"] if k in cols), None)
+    if not code_col or not qty_col:
+        raise ValueError("El archivo de devoluciones debe tener Código SAP y Cantidad.")
+    raw["SAP"] = raw[code_col].map(sap_clean)
+    raw["Cantidad"] = raw[qty_col].map(num)
+    raw["Unidad de medida"] = raw[unit_col].fillna("").astype(str).str.upper().str.strip() if unit_col else ""
+    raw = raw[(raw["SAP"] != "") & (raw["Cantidad"] > 0)]
+    out = raw.groupby(["SAP", "Unidad de medida"], as_index=False)["Cantidad"].sum()
+    out["Descripción"] = out["SAP"].map(descs).fillna("DEVOLUCIÓN SMM")
+    out["Centro"] = 0
+    out["Almacén"] = 8
+    out["Origen"] = "SMM - DEVOLUCIÓN"
+    return out[["SAP", "Descripción", "Centro", "Almacén", "Origen", "Cantidad", "Unidad de medida"]]
 
 def find_center(file, sheet):
     sample = pd.read_excel(file, sheet_name=sheet, header=None, nrows=8)
@@ -95,82 +116,71 @@ def find_header(file, sheet):
             if quality != "SIN COLUMNA": return row_idx
     return None
 
-def allocate_cross_center(report, stock):
-    """Primero consume todo el 0008 central de Monte; luego 0005 de plantas.
-    Cada unidad se reserva una sola vez. Se prioriza la planta destino y luego otras plantas.
+def allocate_cross_center(report, stock, returns):
+    """Asigna stock 0008 de centros como préstamos y devoluciones como stock SMM.
+    No consulta ni utiliza almacén 0005. Cada cantidad se reserva una sola vez.
     """
     out = report.copy()
-    for col in ["Cantidad sugerida enviar desde Monte 0008", "Cantidad sugerida pedir a plantas 0005"]:
-        out[col] = 0.0
-    out["Plantas que proveen"] = ""
-    out["Pendiente luego de stock Monte 0008"] = out["Pendiente"]
+    out["Cantidad sugerida enviar desde SMM"] = 0.0
+    out["Cantidad sugerida por préstamo"] = 0.0
+    out["Centros que prestan"] = ""
     out["Pendiente final"] = out["Pendiente"]
     out["Plan de abastecimiento"] = ""
+    loan_cols = ["SAP", "Descripción SAP", "Tipo de movimiento", "Centro que envía", "Centro destino", "Taller", "Paquete", "Cantidad"]
     valid_idx = out.index[out["Validación"] == "CONFIRMAR"].tolist()
-    loan_cols = ["SAP", "Descripción SAP", "Almacén origen", "Obra que presta", "Centro que presta", "Obra que recibe", "Centro destino", "Taller", "Paquete", "Cantidad préstamo"]
     if not valid_idx:
         return out, pd.DataFrame(columns=loan_cols)
 
-    # Disponibilidad central Monte (0008), agregada entre centros SAP habilitados.
-    central = stock[stock["Almacén"] == 8].groupby("SAP")["Cantidad"].sum().to_dict()
-    # Disponibilidad de plantas (0005), separada por centro.
-    plant_df = stock[stock["Almacén"] == 5].groupby(["SAP", "Centro"])["Cantidad"].sum()
-    plants = {(str(k[0]), int(k[1])): max(float(v), 0.0) for k, v in plant_df.items()}
-
-    # Asignación de Monte, una sola bolsa común para todos los paquetes.
+    # Bolsas independientes: devoluciones SMM y stock 0008 por centro.
+    smm = returns.groupby("SAP")["Cantidad"].sum().to_dict() if not returns.empty else {}
+    by_center = stock.groupby(["SAP", "Centro"])["Cantidad"].sum()
+    available = {(str(s), int(c)): max(float(q), 0.0) for (s, c), q in by_center.items()}
     demands = out.loc[valid_idx].copy()
     line_counts = demands[demands["Pendiente"] > 0].groupby(["Taller", "Paquete", "Centro destino"])["SAP"].count().to_dict()
     demands["_lines"] = demands.apply(lambda r: line_counts.get((r["Taller"], r["Paquete"], r["Centro destino"]), 9999), axis=1)
     demands = demands.sort_values(["_lines", "Pendiente", "Taller", "Paquete"], ascending=[True, True, True, True])
+    movements = []
     for idx, row in demands.iterrows():
-        code = str(row["SAP"]); need = max(float(row["Pendiente"]), 0.0)
-        take = min(need, max(float(central.get(code, 0.0)), 0.0))
-        out.at[idx, "Cantidad sugerida enviar desde Monte 0008"] = take
-        central[code] = max(float(central.get(code, 0.0)) - take, 0.0)
-        out.at[idx, "Pendiente luego de stock Monte 0008"] = max(need - take, 0.0)
-        out.at[idx, "Pendiente final"] = max(need - take, 0.0)
-        if take > 0: out.at[idx, "Plan de abastecimiento"] = f"Monte (almacén 0008): {take:g}"
-        if need > 0 and take >= need: out.at[idx, "Estado"] = "CUBIERTO CON STOCK MONTE 0008"
-
-    # Lo que resta se solicita a plantas 0005. Primero la planta destino, luego otras con saldo.
-    pending = out[(out["Validación"] == "CONFIRMAR") & (out["Pendiente luego de stock Monte 0008"] > 0)].copy()
-    rem_lines = pending.groupby(["Taller", "Paquete", "Centro destino"])["SAP"].count().to_dict()
-    pending["_lines"] = pending.apply(lambda r: rem_lines.get((r["Taller"], r["Paquete"], r["Centro destino"]), 9999), axis=1)
-    pending = pending.sort_values(["_lines", "Pendiente luego de stock Monte 0008", "Taller", "Paquete"], ascending=[True, True, True, True])
-    loans = []
-    for idx, row in pending.iterrows():
-        code = str(row["SAP"]); dest = int(row["Centro destino"])
-        need = float(out.at[idx, "Pendiente luego de stock Monte 0008"])
-        donor_keys = [(c, q) for (sap, c), q in plants.items() if sap == code and q > 0]
-        donor_keys.sort(key=lambda x: (0 if x[0] == dest else 1, -x[1], x[0]))
+        code, dest = str(row["SAP"]), int(row["Centro destino"])
+        need = max(float(row["Pendiente"]), 0.0)
+        # Primero usar devoluciones que están físicamente en SMM.
+        take_smm = min(need, max(float(smm.get(code, 0)), 0.0))
+        if take_smm > 0:
+            smm[code] -= take_smm
+            need -= take_smm
+            out.at[idx, "Cantidad sugerida enviar desde SMM"] += take_smm
+            movements.append({"SAP": code, "Descripción SAP": row["Descripción SAP"], "Tipo de movimiento": "ENVÍO DESDE SMM (DEVOLUCIÓN)", "Centro que envía": "SMM", "Centro destino": dest, "Taller": row["Taller"], "Paquete": row["Paquete"], "Cantidad": take_smm})
+        # Después, préstamo desde el 0008 de los centros. Prioriza centros distintos del destino
+        # y conserva el origen para informar quién presta a quién.
+        donors = [(c, q) for (s, c), q in available.items() if s == code and q > 0]
+        donors.sort(key=lambda x: (0 if x[0] != dest else 1, -x[1], x[0]))
         sources = []
-        for donor, qty in donor_keys:
+        for donor, qty in donors:
             if need <= 0: break
-            take = min(need, plants[(code, donor)])
+            take = min(need, available[(code, donor)])
             if take <= 0: continue
-            plants[(code, donor)] -= take; need -= take
-            out.at[idx, "Cantidad sugerida pedir a plantas 0005"] += take
-            sources.append(f"Centro {donor} (0005): {take:g}")
-            loans.append({"SAP": code, "Descripción SAP": row["Descripción SAP"], "Almacén origen": "0005",
-                "Obra que presta": f"Centro {donor}", "Centro que presta": donor,
-                "Obra que recibe": f"Centro {dest}", "Centro destino": dest,
-                "Taller": row["Taller"], "Paquete": row["Paquete"], "Cantidad préstamo": take})
-        out.at[idx, "Plantas que proveen"] = "; ".join(sources)
+            available[(code, donor)] -= take
+            need -= take
+            out.at[idx, "Cantidad sugerida por préstamo"] += take
+            movement_type = "STOCK DEL CENTRO DESTINO" if donor == dest else "PRÉSTAMO ENTRE CENTROS"
+            sources.append(f"{movement_type} - Centro {donor}: {take:g}")
+            movements.append({"SAP": code, "Descripción SAP": row["Descripción SAP"], "Tipo de movimiento": movement_type, "Centro que envía": donor, "Centro destino": dest, "Taller": row["Taller"], "Paquete": row["Paquete"], "Cantidad": take})
+        out.at[idx, "Centros que prestan"] = "; ".join(sources)
         out.at[idx, "Pendiente final"] = max(need, 0.0)
-        parts = []
-        local_qty = float(out.at[idx, "Cantidad sugerida enviar desde Monte 0008"])
-        if local_qty > 0: parts.append(f"Monte (0008): {local_qty:g}")
-        parts.extend(sources)
-        out.at[idx, "Plan de abastecimiento"] = " | ".join(parts)
-        if out.at[idx, "Pendiente final"] <= 0 and out.at[idx, "Pendiente"] > 0:
-            out.at[idx, "Estado"] = "CUBIERTO CON MONTE Y/O PLANTAS"
-        elif out.at[idx, "Cantidad sugerida pedir a plantas 0005"] > 0:
-            out.at[idx, "Estado"] = "PARCIALMENTE CUBIERTO POR PLANTAS"
-    return out, pd.DataFrame(loans, columns=loan_cols)
+        plan = []
+        if take_smm > 0: plan.append(f"SMM devolución: {take_smm:g}")
+        if sources: plan.extend([f"PRÉSTAMO {x}" for x in sources])
+        out.at[idx, "Plan de abastecimiento"] = " | ".join(plan)
+        if float(out.at[idx, "Pendiente"]) > 0 and need <= 0:
+            out.at[idx, "Estado"] = "CUBIERTO CON SMM Y/O PRÉSTAMO"
+        elif sources or take_smm > 0:
+            out.at[idx, "Estado"] = "PARCIALMENTE CUBIERTO"
+        elif float(out.at[idx, "Pendiente"]) > 0:
+            out.at[idx, "Estado"] = "SIN STOCK 0008 DISPONIBLE"
+    return out, pd.DataFrame(movements, columns=loan_cols)
 
-def process(stock_file, package_files):
+def process(stock_file, package_files, returns_file=None):
     stock, descs = read_stock(stock_file)
-    stock_dict = stock[stock["Almacén"] == 8].groupby("SAP")["Cantidad"].sum().to_dict()
     rows, issues, audit = [], [], []
     skip_tokens = ["STOCK", "AVANCE", "RESUMEN", "TABLA6", "TABLA 6"]
     for file in package_files:
@@ -224,18 +234,14 @@ def process(stock_file, package_files):
                     # La descripción principal siempre sale del maestro de materiales del stock SAP.
                     # La descripción escrita en el archivo del taller se conserva en otra columna para comparar.
                     description_sap = descs.get(code, "")
-                    local_stock = max(float(stock_dict.get(code, 0)), 0)
                     pending_pos = max(pending, 0)
-                    suggested = min(pending_pos, local_stock) if quality == "CONFIRMAR" else 0
                     rows.append({
                         "Taller": workshop, "Paquete": sheet, "Centro destino": int(center),
                         "SAP": code, "Descripción SAP": description_sap if description_sap else "NO ENCONTRADO EN STOCK SAP", "Descripción taller": description_workshop,
                         "Columna pendiente": p_name,
                         "Pendiente original": pending, "Pendiente": pending_pos,
-                        "Stock Monte 0008 SAP": local_stock, "Cantidad sugerida enviar desde Monte 0008": suggested,
-                        "Pendiente luego de stock Monte 0008": max(pending_pos-suggested, 0),
                         "Validación": quality,
-                        "Estado": "REVISAR COLUMNA" if quality != "CONFIRMAR" else ("ENVIAR DESDE STOCK LOCAL" if suggested > 0 else "SIN STOCK LOCAL")
+                        "Estado": "REVISAR COLUMNA" if quality != "CONFIRMAR" else "PENDIENTE DE ASIGNACIÓN"
                     })
                     valid_rows += 1
                 if valid_rows:
@@ -249,33 +255,33 @@ def process(stock_file, package_files):
     report = pd.DataFrame(rows)
     audit_df = pd.DataFrame(audit)
     if report.empty: raise ValueError("No se encontraron tablas de paquetes válidas. Revisá la hoja Control de lectura.")
-    report, loans = allocate_cross_center(report, stock)
-    return report, pd.DataFrame(issues), stock, audit_df, loans
+    returns = read_returns(returns_file, descs)
+    report, movements = allocate_cross_center(report, stock, returns)
+    return report, pd.DataFrame(issues), stock, audit_df, movements, returns
 
-def make_excel(report, issues, audit, loans, stock, workshop, center, only_sendable):
+def make_excel(report, issues, audit, movements, stock, returns, workshop, center, only_sendable):
     data = report.copy()
     if workshop != "Todos": data = data[data["Taller"] == workshop]
     if center != "Todos": data = data[data["Centro destino"] == int(center)]
-    if only_sendable: data = data[((data["Cantidad sugerida enviar desde Monte 0008"] > 0) | (data["Cantidad sugerida pedir a plantas 0005"] > 0)) & (data["Validación"] == "CONFIRMAR")]
-    send = data[((data["Cantidad sugerida enviar desde Monte 0008"] > 0) | (data["Cantidad sugerida pedir a plantas 0005"] > 0)) & (data["Validación"] == "CONFIRMAR")]
+    sendable_mask = ((data["Cantidad sugerida enviar desde SMM"] > 0) | (data["Cantidad sugerida por préstamo"] > 0)) & (data["Validación"] == "CONFIRMAR")
+    if only_sendable: data = data[sendable_mask]
+    send = data[((data["Cantidad sugerida enviar desde SMM"] > 0) | (data["Cantidad sugerida por préstamo"] > 0)) & (data["Validación"] == "CONFIRMAR")]
     no_stock = data[(data["Pendiente"] > 0) & (data["Pendiente final"] > 0) & (data["Validación"] == "CONFIRMAR")]
-    if workshop != "Todos": loans = loans[loans["Taller"] == workshop]
-    if center != "Todos": loans = loans[loans["Centro destino"] == int(center)]
+    if workshop != "Todos": movements = movements[movements["Taller"] == workshop]
+    if center != "Todos": movements = movements[movements["Centro destino"] == int(center)]
     review = data[data["Validación"] != "CONFIRMAR"]
     summary = data.groupby("Taller", as_index=False).agg(
-        Filas=("SAP", "count"),
-        Materiales_con_stock_monte=("Cantidad sugerida enviar desde Monte 0008", lambda x: int((x > 0).sum())),
-        Pendiente_total=("Pendiente", "sum"),
-        Cantidad_sugerida_monte=("Cantidad sugerida enviar desde Monte 0008", "sum"),
-        Pendiente_no_cubierto=("Pendiente final", "sum")
-    )
+        Filas=("SAP", "count"), Pendiente_total=("Pendiente", "sum"),
+        Envio_SMM=("Cantidad sugerida enviar desde SMM", "sum"),
+        Prestamos=("Cantidad sugerida por préstamo", "sum"),
+        Pendiente_no_cubierto=("Pendiente final", "sum"))
     out = BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         data.to_excel(writer, sheet_name="Detalle", index=False)
         send.to_excel(writer, sheet_name="Preparar envíos", index=False)
-        loans.to_excel(writer, sheet_name="Pedir a plantas 0005", index=False)
-        stock[stock["Almacén"] == 8].to_excel(writer, sheet_name="Stock Monte 0008", index=False)
-        stock[stock["Almacén"] == 5].to_excel(writer, sheet_name="Stock plantas 0005", index=False)
+        movements.to_excel(writer, sheet_name="Préstamos y envíos", index=False)
+        stock.to_excel(writer, sheet_name="Stock SAP 0008 por centro", index=False)
+        returns.to_excel(writer, sheet_name="Devoluciones SMM", index=False)
         no_stock.to_excel(writer, sheet_name="Faltante final", index=False)
         review.to_excel(writer, sheet_name="Revisar columnas", index=False)
         summary.to_excel(writer, sheet_name="Resumen talleres", index=False)
@@ -289,24 +295,26 @@ def make_excel(report, issues, audit, loans, stock, workshop, center, only_senda
                 width = max((len(str(c.value)) if c.value is not None else 0) for c in col[:100])
                 ws.column_dimensions[letter].width = min(width + 2, 42)
     out.seek(0)
-    return out.getvalue(), data, send, no_stock, review, summary, loans
+    return out.getvalue(), data, send, no_stock, review, summary
 
 st.title("📦 Control de Stock Piping")
-st.caption("Almacén 0008 = stock central de Monte. Almacén 0005 = stock de cada planta, disponible para solicitar. Se excluyen los centros 3115 y 3116.")
+st.caption("Solo almacén 0008 de los centros habilitados. El stock de otros centros se propone como PRÉSTAMO; las devoluciones se consideran stock adicional de SMM.")
 
 with st.sidebar:
     st.header("Cargar archivos actualizados")
     stock_file = st.file_uploader("Stock SAP (.xlsx)", type=["xlsx", "xlsm"])
+    returns_file = st.file_uploader("Stock adicional SMM - devoluciones (opcional)", type=["xlsx", "xlsm"])
     package_files = st.file_uploader("Archivos de paquetes (.xlsx / .xlsm)", type=["xlsx", "xlsm"], accept_multiple_files=True)
-    st.info("Esta versión procesa archivos cargados manualmente. No modifica los originales.")
+    st.info("Se utiliza únicamente el almacén 0008. El stock de otros centros se propone como PRÉSTAMO; las devoluciones se consideran stock de SMM.")
 
 if stock_file and package_files:
     if st.button("🔄 Procesar y actualizar reporte", type="primary", use_container_width=True):
         with st.spinner("Procesando stock y paquetes..."):
             try:
-                report, issues, stock, audit, loans = process(stock_file, package_files)
+                report, issues, stock, audit, movements, returns = process(stock_file, package_files, returns_file)
                 st.session_state["report"] = report
-                st.session_state["loans"] = loans
+                st.session_state["movements"] = movements
+                st.session_state["returns"] = returns
                 st.session_state["stock"] = stock
                 st.session_state["issues"] = issues
                 st.session_state["audit"] = audit
@@ -319,10 +327,11 @@ if "report" in st.session_state:
     report = st.session_state["report"]
     issues = st.session_state["issues"]
     audit = st.session_state["audit"]
-    loans = st.session_state.get("loans", pd.DataFrame())
+    movements = st.session_state.get("movements", pd.DataFrame())
+    returns = st.session_state.get("returns", pd.DataFrame())
     st.caption(f"Última actualización: {st.session_state['last_run']}")
     pending = report[report["Pendiente"] > 0]
-    sendable = report[((report["Cantidad sugerida enviar desde Monte 0008"] > 0) | (report["Cantidad sugerida pedir a plantas 0005"] > 0)) & (report["Validación"] == "CONFIRMAR")]
+    sendable = report[((report["Cantidad sugerida enviar desde SMM"] > 0) | (report["Cantidad sugerida por préstamo"] > 0)) & (report["Validación"] == "CONFIRMAR")]
     a, b, c, d = st.columns(4)
     a.metric("Filas de materiales", len(report))
     b.metric("Materiales con pendiente", len(pending))
@@ -338,16 +347,16 @@ if "report" in st.session_state:
         st.info("No hay filas con una columna de pendiente confirmada para graficar.")
     else:
         totals = pd.DataFrame({
-            "Concepto": ["Pendiente total", "Cubierto con stock Monte 0008", "Pedido sugerido a plantas 0005", "Faltante final"],
-            "Cantidad": [valid["Pendiente"].sum(), valid["Cantidad sugerida enviar desde Monte 0008"].sum(), valid["Cantidad sugerida pedir a plantas 0005"].sum(), valid["Pendiente final"].sum()]
+            "Concepto": ["Pendiente total", "Envío desde SMM", "Préstamos entre centros", "Faltante final"],
+            "Cantidad": [valid["Pendiente"].sum(), valid["Cantidad sugerida enviar desde SMM"].sum(), valid["Cantidad sugerida por préstamo"].sum(), valid["Pendiente final"].sum()]
         }).set_index("Concepto")
         st.subheader("Vista general de cantidades")
         st.bar_chart(totals, y="Cantidad", use_container_width=True)
 
         workshop_dashboard = valid.groupby("Taller", as_index=True).agg(
             **{"Pendiente total": ("Pendiente", "sum"),
-               "Cubierto con stock Monte 0008": ("Cantidad sugerida enviar desde Monte 0008", "sum"),
-               "Pedido sugerido a plantas 0005": ("Cantidad sugerida pedir a plantas 0005", "sum"),
+               "Envío desde SMM": ("Cantidad sugerida enviar desde SMM", "sum"),
+               "Préstamos entre centros": ("Cantidad sugerida por préstamo", "sum"),
                "Pendiente restante": ("Pendiente final", "sum")}
         ).sort_values("Pendiente total", ascending=False)
         st.subheader("Pendientes por taller")
@@ -355,18 +364,18 @@ if "report" in st.session_state:
 
         package_dashboard = valid.groupby(["Taller", "Paquete"], as_index=False).agg(
             Pendiente=("Pendiente", "sum"),
-            **{"Stock Monte 0008 sugerido": ("Cantidad sugerida enviar desde Monte 0008", "sum"),
-               "Pedido sugerido a plantas 0005": ("Cantidad sugerida pedir a plantas 0005", "sum"),
+            **{"Envío desde SMM": ("Cantidad sugerida enviar desde SMM", "sum"),
+               "Préstamos": ("Cantidad sugerida por préstamo", "sum"),
                "Saldo restante": ("Pendiente final", "sum")}
         )
         package_dashboard["Taller / paquete"] = package_dashboard["Taller"] + " / " + package_dashboard["Paquete"].astype(str)
         package_dashboard = package_dashboard.sort_values("Pendiente", ascending=False)
         st.subheader("Paquetes con mayor pendiente")
         st.caption("Se muestran los 15 paquetes con mayor cantidad pendiente. Las cantidades corresponden a unidades de los materiales, no a porcentaje de avance.")
-        top_packages = package_dashboard.head(15).set_index("Taller / paquete")[["Pendiente", "Stock Monte 0008 sugerido", "Saldo restante"]]
+        top_packages = package_dashboard.head(15).set_index("Taller / paquete")[["Pendiente", "Envío desde SMM", "Préstamos", "Saldo restante"]]
         st.bar_chart(top_packages, use_container_width=True)
         with st.expander("Ver tabla de avance y pendientes por paquete"):
-            st.dataframe(package_dashboard[["Taller", "Paquete", "Pendiente", "Stock Monte 0008 sugerido", "Pedido sugerido a plantas 0005", "Saldo restante"]], use_container_width=True, hide_index=True)
+            st.dataframe(package_dashboard[["Taller", "Paquete", "Pendiente", "Envío desde SMM", "Préstamos", "Saldo restante"]], use_container_width=True, hide_index=True)
     desc_missing = int(report["Descripción SAP"].eq("NO ENCONTRADO EN STOCK SAP").sum())
     if desc_missing:
         st.warning(f"{desc_missing} filas no encontraron descripción en el archivo SAP cargado. Revisá los códigos en la columna SAP.")
@@ -375,28 +384,28 @@ if "report" in st.session_state:
     c1, c2, c3 = st.columns(3)
     workshop = c1.selectbox("Taller", ["Todos"] + sorted(report["Taller"].dropna().unique().tolist()))
     center = c2.selectbox("Centro destino", ["Todos"] + [str(c) for c in CENTROS])
-    only_sendable = c3.checkbox("Mostrar solo lo que puedo enviar desde Monte", value=False)
+    only_sendable = c3.checkbox("Mostrar solo materiales con envío o préstamo", value=False)
 
     view = report.copy()
     if workshop != "Todos": view = view[view["Taller"] == workshop]
     if center != "Todos": view = view[view["Centro destino"] == int(center)]
-    if only_sendable: view = view[((view["Cantidad sugerida enviar desde Monte 0008"] > 0) | (view["Cantidad sugerida pedir a plantas 0005"] > 0)) & (view["Validación"] == "CONFIRMAR")]
+    if only_sendable: view = view[((view["Cantidad sugerida enviar desde SMM"] > 0) | (view["Cantidad sugerida por préstamo"] > 0)) & (view["Validación"] == "CONFIRMAR")]
 
     st.subheader("Materiales")
     st.dataframe(view[[
         "Taller", "Paquete", "Centro destino", "SAP", "Descripción SAP", "Descripción taller",
-        "Pendiente", "Stock Monte 0008 SAP", "Cantidad sugerida enviar desde Monte 0008",
-        "Cantidad sugerida pedir a plantas 0005", "Plantas que proveen", "Plan de abastecimiento", "Pendiente final", "Validación", "Estado"
+        "Pendiente", "Cantidad sugerida enviar desde SMM", "Cantidad sugerida por préstamo",
+        "Centros que prestan", "Plan de abastecimiento", "Pendiente final", "Validación", "Estado"
     ]], use_container_width=True, hide_index=True)
 
-    st.subheader("📨 Materiales a solicitar a plantas (almacén 0005)")
-    if loans.empty:
-        st.info("No hay préstamos sugeridos con el stock y los paquetes cargados.")
+    st.subheader("📨 Préstamos entre centros y envíos desde SMM")
+    if movements.empty:
+        st.info("No hay envíos ni préstamos sugeridos con el stock y los paquetes cargados.")
     else:
-        st.caption("El almacén 0008 de todos los centros se consolida como stock de Monte. Los pedidos se toman exclusivamente del almacén 0005 de cada planta.")
-        st.dataframe(loans, use_container_width=True, hide_index=True)
+        st.caption("Los movimientos entre centros se identifican expresamente como PRÉSTAMO. Las devoluciones se consideran stock disponible en SMM.")
+        st.dataframe(movements, use_container_width=True, hide_index=True)
 
-    xlsx, _, _, _, _, summary, loans_filtered = make_excel(report, issues, audit, loans, st.session_state["stock"], workshop, center, only_sendable)
+    xlsx, _, _, _, _, summary = make_excel(report, issues, audit, movements, st.session_state["stock"], returns, workshop, center, only_sendable)
     st.download_button("⬇️ Descargar Excel de preparación y préstamos", xlsx, "PLAN_ENVIO_PREPARACION_PRESTAMOS.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
     with st.expander("Resumen por taller"):
@@ -408,4 +417,4 @@ if "report" in st.session_state:
         if issues.empty: st.success("No se registraron incidencias.")
         else: st.dataframe(issues, use_container_width=True, hide_index=True)
 else:
-    st.info("Cargá el archivo de stock SAP y los archivos de paquetes en la barra lateral, y presioná Procesar.")
+    st.info("Cargá el stock SAP, los archivos de paquetes y, opcionalmente, el archivo de devoluciones SMM. Se utiliza únicamente el almacén 0008.")
